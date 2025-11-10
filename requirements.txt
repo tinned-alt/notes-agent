@@ -1,0 +1,28 @@
+# LangChain and core dependencies
+langchain>=0.3.0
+langchain-anthropic>=0.1.0
+langchain-community>=0.0.20
+langgraph>=0.6.0
+
+# Vector store and embeddings
+chromadb>=0.4.22
+sentence-transformers>=2.3.1
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+pyyaml>=6.0.1
+
+# File processing
+python-frontmatter>=1.1.0
+pypdf>=4.0.0
+python-docx>=1.1.0
+python-pptx>=0.6.23
+striprtf>=0.0.26
+beautifulsoup4>=4.12.0
+requests>=2.31.0
+
+# CLI and user interface
+rich>=13.7.0
+typer>=0.9.0
