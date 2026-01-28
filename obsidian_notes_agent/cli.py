@@ -2,9 +2,13 @@
 """CLI entry point for the Obsidian Notes Agent package."""
 
 import sys
+import glob as glob_module
 from pathlib import Path
+from typing import List, Optional
 import typer
 from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.table import Table
 from dotenv import load_dotenv
 
 from obsidian_notes_agent.config import get_settings
@@ -139,6 +143,188 @@ def ingest(
             console.print("[green]✓ Vector store updated[/green]")
 
         console.print("\n[green]✓ Content ingestion complete![/green]")
+
+    except ValueError as e:
+        console.print(f"\n[red]Configuration error: {e}[/red]")
+        console.print("[yellow]Please check your .env file[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"\n[red]Error: {e}[/red]")
+        import traceback
+        console.print(f"[dim]{traceback.format_exc()}[/dim]")
+        sys.exit(1)
+
+
+@app.command()
+def batch(
+    sources: List[str] = typer.Argument(
+        None,
+        help="URLs or file paths to ingest (supports glob patterns like *.pdf)"
+    ),
+    file: Optional[Path] = typer.Option(
+        None,
+        "--file", "-f",
+        help="File containing URLs/paths to ingest (one per line)"
+    ),
+    reindex: bool = typer.Option(
+        False,
+        "--reindex",
+        help="Rebuild the vector store after all ingestions"
+    ),
+    continue_on_error: bool = typer.Option(
+        True,
+        "--continue-on-error/--stop-on-error",
+        help="Continue processing if one source fails"
+    )
+):
+    """Batch ingest multiple URLs or files at once.
+
+    Examples:
+        notes batch https://example.com/a https://example.com/b
+        notes batch ~/Documents/*.pdf
+        notes batch --file urls.txt
+        notes batch "~/Papers/*.pdf" "~/Articles/*.md"
+    """
+    try:
+        settings = get_settings()
+
+        # Check if vault exists
+        if not settings.obsidian_vault_path.exists():
+            console.print(
+                f"[red]Error: Vault path does not exist: {settings.obsidian_vault_path}[/red]"
+            )
+            console.print("[yellow]Please set OBSIDIAN_VAULT_PATH in your .env file[/yellow]")
+            sys.exit(1)
+
+        # Collect all sources to process
+        all_sources: List[str] = []
+
+        # Add sources from command line arguments
+        if sources:
+            for source in sources:
+                # Check if it's a glob pattern for local files
+                if not source.startswith(('http://', 'https://')) and ('*' in source or '?' in source):
+                    # Expand glob pattern
+                    expanded = Path(source).expanduser()
+                    matches = glob_module.glob(str(expanded), recursive=True)
+                    if matches:
+                        all_sources.extend(sorted(matches))
+                    else:
+                        console.print(f"[yellow]Warning: No files matched pattern: {source}[/yellow]")
+                else:
+                    # Expand ~ for regular file paths
+                    if not source.startswith(('http://', 'https://')):
+                        source = str(Path(source).expanduser())
+                    all_sources.append(source)
+
+        # Add sources from file
+        if file:
+            if not file.exists():
+                console.print(f"[red]Error: File not found: {file}[/red]")
+                sys.exit(1)
+
+            with open(file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if line and not line.startswith('#'):
+                        # Expand ~ for file paths
+                        if not line.startswith(('http://', 'https://')):
+                            line = str(Path(line).expanduser())
+                        all_sources.append(line)
+
+        if not all_sources:
+            console.print("[red]Error: No sources provided. Use arguments or --file option.[/red]")
+            console.print("\nExamples:")
+            console.print("  notes batch https://example.com/article1 https://example.com/article2")
+            console.print("  notes batch ~/Documents/*.pdf")
+            console.print("  notes batch --file urls.txt")
+            sys.exit(1)
+
+        # Initialize agent
+        agent = NotesAgent(settings)
+
+        # Ensure vector store exists
+        if not settings.vector_store_path.exists():
+            console.print("[yellow]Vector store not found. Initializing...[/yellow]")
+            agent.initialize_vector_store()
+
+        console.print(f"\n[bold cyan]Batch Ingestion[/bold cyan]")
+        console.print(f"Processing {len(all_sources)} source(s)...\n")
+
+        # Track results
+        results = {'success': [], 'failed': []}
+
+        # Process each source with progress bar
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Ingesting...", total=len(all_sources))
+
+            for i, source in enumerate(all_sources, 1):
+                progress.update(task, description=f"[{i}/{len(all_sources)}] {source[:50]}...")
+
+                try:
+                    query_text = f'Ingest content from "{source}"'
+                    response = agent.run(query_text)
+                    results['success'].append({'source': source, 'response': response})
+                except Exception as e:
+                    error_msg = str(e)
+                    results['failed'].append({'source': source, 'error': error_msg})
+                    if not continue_on_error:
+                        progress.stop()
+                        console.print(f"\n[red]Error processing {source}: {error_msg}[/red]")
+                        console.print("[yellow]Stopping batch processing (use --continue-on-error to skip failures)[/yellow]")
+                        break
+
+                progress.advance(task)
+
+        # Display results summary
+        console.print("\n[bold]Results Summary[/bold]")
+
+        # Success table
+        if results['success']:
+            success_table = Table(title=f"✓ Successfully Ingested ({len(results['success'])})")
+            success_table.add_column("Source", style="green")
+            for item in results['success']:
+                # Truncate long sources
+                source_display = item['source']
+                if len(source_display) > 80:
+                    source_display = "..." + source_display[-77:]
+                success_table.add_row(source_display)
+            console.print(success_table)
+
+        # Failed table
+        if results['failed']:
+            failed_table = Table(title=f"✗ Failed ({len(results['failed'])})")
+            failed_table.add_column("Source", style="red")
+            failed_table.add_column("Error", style="dim")
+            for item in results['failed']:
+                source_display = item['source']
+                if len(source_display) > 50:
+                    source_display = "..." + source_display[-47:]
+                error_display = item['error'][:50] + "..." if len(item['error']) > 50 else item['error']
+                failed_table.add_row(source_display, error_display)
+            console.print(failed_table)
+
+        # Final stats
+        console.print(f"\n[bold]Total:[/bold] {len(results['success'])} succeeded, {len(results['failed'])} failed")
+
+        # Optionally reindex
+        if reindex and results['success']:
+            console.print("\n[yellow]Reindexing vector store...[/yellow]")
+            agent.initialize_vector_store()
+            console.print("[green]✓ Vector store updated[/green]")
+
+        if results['success']:
+            console.print("\n[green]✓ Batch ingestion complete![/green]")
+        else:
+            console.print("\n[red]✗ No sources were successfully ingested[/red]")
+            sys.exit(1)
 
     except ValueError as e:
         console.print(f"\n[red]Configuration error: {e}[/red]")
