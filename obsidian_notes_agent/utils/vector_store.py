@@ -1,13 +1,17 @@
 """Vector store management for semantic search over notes."""
 
 import hashlib
+import logging
+import os
 from pathlib import Path
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Set
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from obsidian_notes_agent.utils.obsidian import ObsidianVault
+
+logger = logging.getLogger(__name__)
 
 
 class NoteVectorStore:
@@ -65,6 +69,9 @@ class NoteVectorStore:
 
         Returns:
             List of document IDs for this note
+
+        Raises:
+            RuntimeError: If there's a database error (not just empty results)
         """
         try:
             collection = self.vector_store._collection
@@ -74,8 +81,9 @@ class NoteVectorStore:
                 include=[]
             )
             return results['ids'] if results and results['ids'] else []
-        except Exception:
-            return []
+        except Exception as e:
+            logger.error(f"Failed to get document IDs for {note_path}: {e}")
+            raise RuntimeError(f"Database error while querying note: {e}") from e
 
     def delete_note_from_index(self, note_path: Path) -> int:
         """Delete all chunks for a specific note from the index.
@@ -85,14 +93,23 @@ class NoteVectorStore:
 
         Returns:
             Number of documents deleted
+
+        Raises:
+            RuntimeError: If deletion fails due to database error
         """
-        doc_ids = self._get_note_doc_ids(note_path)
+        try:
+            doc_ids = self._get_note_doc_ids(note_path)
+        except RuntimeError:
+            # Note not in index, nothing to delete
+            return 0
+
         if doc_ids:
             try:
                 self.vector_store._collection.delete(ids=doc_ids)
                 return len(doc_ids)
-            except Exception:
-                return 0
+            except Exception as e:
+                logger.error(f"Failed to delete documents for {note_path}: {e}")
+                raise RuntimeError(f"Database error while deleting note: {e}") from e
         return 0
 
     def add_note_to_index(self, note_path: Path) -> int:
@@ -106,8 +123,15 @@ class NoteVectorStore:
         """
         try:
             note_data = self.vault.read_note(note_path)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to read note {note_path}: {e}")
             return 0
+
+        # Get modification time for change detection
+        try:
+            mtime = os.path.getmtime(note_path)
+        except OSError:
+            mtime = 0
 
         # Create metadata
         metadata = {
@@ -115,6 +139,7 @@ class NoteVectorStore:
             'title': note_data['title'],
             'tags': note_data['metadata'].get('tags', []),
             'created': note_data['metadata'].get('created', ''),
+            'mtime': mtime,
         }
 
         # Combine title and content for better search
@@ -148,9 +173,20 @@ class NoteVectorStore:
         """
         notes = self.vault.get_all_notes()
         documents = []
+        doc_ids = []
 
         for note_path in notes:
-            note_data = self.vault.read_note(note_path)
+            try:
+                note_data = self.vault.read_note(note_path)
+            except Exception as e:
+                logger.warning(f"Failed to read note {note_path}: {e}")
+                continue
+
+            # Get modification time for change detection
+            try:
+                mtime = os.path.getmtime(note_path)
+            except OSError:
+                mtime = 0
 
             # Create metadata
             metadata = {
@@ -158,6 +194,7 @@ class NoteVectorStore:
                 'title': note_data['title'],
                 'tags': note_data['metadata'].get('tags', []),
                 'created': note_data['metadata'].get('created', ''),
+                'mtime': mtime,
             }
 
             # Combine title and content for better search
@@ -169,18 +206,22 @@ class NoteVectorStore:
             for i, chunk in enumerate(chunks):
                 chunk_metadata = metadata.copy()
                 chunk_metadata['chunk'] = i
+                # Generate stable document ID for consistent updates
+                doc_id = self._generate_doc_id(note_path, i)
                 documents.append(Document(
                     page_content=chunk,
                     metadata=chunk_metadata
                 ))
+                doc_ids.append(doc_id)
 
         if documents:
-            # Clear existing collection and add new documents
+            # Clear existing collection and add new documents with stable IDs
             self.vector_store = Chroma.from_documents(
                 documents=documents,
                 embedding=self.embeddings,
                 persist_directory=str(self.persist_directory),
-                collection_name="obsidian_notes"
+                collection_name="obsidian_notes",
+                ids=doc_ids
             )
 
         return len(documents)
@@ -228,47 +269,78 @@ class NoteVectorStore:
         """Synchronize the index with the current vault state.
 
         This is more efficient than index_all_notes() as it only updates
-        notes that have changed, been added, or been removed.
+        notes that have changed, been added, or been removed. Uses file
+        modification times to detect changes.
 
         Returns:
-            Dictionary with counts: {'added': N, 'removed': N, 'updated': N}
+            Dictionary with counts: {'added': N, 'removed': N, 'updated': N, 'unchanged': N}
         """
         stats = {'added': 0, 'removed': 0, 'updated': 0, 'unchanged': 0}
 
-        # Get all notes currently in vault
-        vault_notes = set(str(p) for p in self.vault.get_all_notes())
+        # Get all notes currently in vault with their modification times
+        vault_notes: Dict[str, float] = {}
+        for p in self.vault.get_all_notes():
+            try:
+                vault_notes[str(p)] = os.path.getmtime(p)
+            except OSError:
+                vault_notes[str(p)] = 0
 
-        # Get all notes currently in index
-        indexed_notes: Set[str] = set()
+        # Get all notes currently in index with their stored modification times
+        indexed_notes: Dict[str, float] = {}
         try:
             collection = self.vector_store._collection
             results = collection.get(include=['metadatas'])
             if results and results['metadatas']:
                 for metadata in results['metadatas']:
                     if metadata and 'source' in metadata:
-                        indexed_notes.add(metadata['source'])
-        except Exception:
+                        source = metadata['source']
+                        # Only store mtime once per note (first chunk seen)
+                        if source not in indexed_notes:
+                            indexed_notes[source] = metadata.get('mtime', 0)
+        except Exception as e:
             # If we can't read the index, do a full reindex
+            logger.warning(f"Failed to read index, performing full reindex: {e}")
             self.index_all_notes()
             return {'added': len(vault_notes), 'removed': 0, 'updated': 0, 'unchanged': 0}
 
+        vault_paths = set(vault_notes.keys())
+        indexed_paths = set(indexed_notes.keys())
+
         # Find notes to add (in vault but not in index)
-        notes_to_add = vault_notes - indexed_notes
+        notes_to_add = vault_paths - indexed_paths
         for note_path_str in notes_to_add:
             note_path = Path(note_path_str)
             if note_path.exists():
-                self.add_note_to_index(note_path)
-                stats['added'] += 1
+                try:
+                    self.add_note_to_index(note_path)
+                    stats['added'] += 1
+                except Exception as e:
+                    logger.warning(f"Failed to add note {note_path}: {e}")
 
         # Find notes to remove (in index but not in vault)
-        notes_to_remove = indexed_notes - vault_notes
+        notes_to_remove = indexed_paths - vault_paths
         for note_path_str in notes_to_remove:
-            self.delete_note_from_index(Path(note_path_str))
-            stats['removed'] += 1
+            try:
+                self.delete_note_from_index(Path(note_path_str))
+                stats['removed'] += 1
+            except Exception as e:
+                logger.warning(f"Failed to remove note {note_path_str}: {e}")
 
-        # For notes in both, we could check modification time, but for now
-        # we'll leave them unchanged (full reindex handles updates)
-        stats['unchanged'] = len(vault_notes & indexed_notes)
+        # Check for modified notes (in both, but mtime changed)
+        common_notes = vault_paths & indexed_paths
+        for note_path_str in common_notes:
+            vault_mtime = vault_notes[note_path_str]
+            indexed_mtime = indexed_notes.get(note_path_str, 0)
+
+            # If modification time changed, re-index the note
+            if vault_mtime > indexed_mtime:
+                try:
+                    self.update_note_index(Path(note_path_str))
+                    stats['updated'] += 1
+                except Exception as e:
+                    logger.warning(f"Failed to update note {note_path_str}: {e}")
+            else:
+                stats['unchanged'] += 1
 
         return stats
 

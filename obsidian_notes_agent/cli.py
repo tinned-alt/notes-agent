@@ -159,12 +159,14 @@ def ingest(
 def batch(
     sources: List[str] = typer.Argument(
         None,
-        help="URLs or file paths to ingest (supports glob patterns like *.pdf)"
+        help="URLs or file paths to ingest (supports glob patterns like *.pdf). "
+             "Required if --file is not provided."
     ),
     file: Optional[Path] = typer.Option(
         None,
         "--file", "-f",
-        help="File containing URLs/paths to ingest (one per line)"
+        help="File containing URLs/paths to ingest (one per line). "
+             "Required if no sources are provided as arguments."
     ),
     reindex: bool = typer.Option(
         False,
@@ -223,7 +225,7 @@ def batch(
                 console.print(f"[red]Error: File not found: {file}[/red]")
                 sys.exit(1)
 
-            with open(file, 'r') as f:
+            with open(file, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     # Skip empty lines and comments

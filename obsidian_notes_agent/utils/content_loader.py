@@ -11,6 +11,54 @@ from bs4 import BeautifulSoup
 class ContentLoader:
     """Load and extract content from various sources."""
 
+    # Standard Chrome User-Agent for web requests
+    USER_AGENT = (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    )
+    # HTTP request timeout in seconds
+    REQUEST_TIMEOUT = 15
+
+    @staticmethod
+    def _format_timestamp(total_seconds: int) -> str:
+        """Format seconds into timestamp string.
+
+        Uses HH:MM:SS for videos >= 1 hour, MM:SS otherwise.
+
+        Args:
+            total_seconds: Number of seconds
+
+        Returns:
+            Formatted timestamp string
+        """
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+
+        if hours > 0:
+            return f"[{hours:d}:{minutes:02d}:{seconds:02d}]"
+        return f"[{minutes:02d}:{seconds:02d}]"
+
+    @staticmethod
+    def _format_duration(total_seconds: int) -> str:
+        """Format total seconds into duration string.
+
+        Uses H:MM:SS for durations >= 1 hour, M:SS otherwise.
+
+        Args:
+            total_seconds: Total duration in seconds
+
+        Returns:
+            Formatted duration string
+        """
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+
+        if hours > 0:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes}:{seconds:02d}"
+
     @staticmethod
     def extract_youtube_video_id(url: str) -> Optional[str]:
         """Extract YouTube video ID from various URL formats.
@@ -95,10 +143,8 @@ class ContentLoader:
 
         try:
             # Fetch video title from YouTube page
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            response = requests.get(url, headers=headers, timeout=30)
+            headers = {'User-Agent': ContentLoader.USER_AGENT}
+            response = requests.get(url, headers=headers, timeout=ContentLoader.REQUEST_TIMEOUT)
             soup = BeautifulSoup(response.text, 'html.parser')
 
             # Extract title
@@ -142,15 +188,11 @@ class ContentLoader:
             # Fetch the actual transcript data
             transcript_data = transcript.fetch()
 
-            # Format transcript with timestamps
+            # Format transcript with timestamps (HH:MM:SS for videos >= 1 hour)
             content_parts = []
             for entry in transcript_data:
-                # Convert seconds to MM:SS format
                 seconds = int(entry['start'])
-                minutes = seconds // 60
-                secs = seconds % 60
-                timestamp = f"[{minutes:02d}:{secs:02d}]"
-
+                timestamp = ContentLoader._format_timestamp(seconds)
                 text = entry['text'].strip()
                 content_parts.append(f"{timestamp} {text}")
 
@@ -160,9 +202,7 @@ class ContentLoader:
             if transcript_data:
                 last_entry = transcript_data[-1]
                 total_seconds = int(last_entry['start'] + last_entry.get('duration', 0))
-                duration_minutes = total_seconds // 60
-                duration_seconds = total_seconds % 60
-                duration = f"{duration_minutes}:{duration_seconds:02d}"
+                duration = ContentLoader._format_duration(total_seconds)
             else:
                 duration = "Unknown"
 
@@ -204,10 +244,8 @@ class ContentLoader:
         """
         try:
             # Fetch the URL
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            response = requests.get(url, headers=headers, timeout=30)
+            headers = {'User-Agent': ContentLoader.USER_AGENT}
+            response = requests.get(url, headers=headers, timeout=ContentLoader.REQUEST_TIMEOUT)
             response.raise_for_status()
 
             # Parse HTML
